@@ -61,6 +61,9 @@ logs/
 .env.local
 .env.production
 
+# Configuration files with credentials
+config.json
+
 # Pytest
 .pytest_cache/
 .coverage

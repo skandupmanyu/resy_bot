@@ -1,0 +1,21 @@
+{
+  "resy_credentials": {
+    "email": "your-email@example.com",
+    "password": "your-password-here"
+  },
+  "reservation_settings": {
+    "restaurant_url": "https://resy.com/cities/new-york-ny/venues/restaurant-name",
+    "days_range": 7,
+    "default_first_slot": true
+  },
+  "automation_preferences": {
+    "auto_confirm_booking": false,
+    "preferred_time_slots": ["6:00 PM", "6:30 PM", "7:00 PM", "7:30 PM", "8:00 PM"],
+    "preferred_seating": ["Dining Room", "Indoor Dining Rm"]
+  },
+  "notifications": {
+    "success_message": true,
+    "booking_details": true,
+    "debug_output": true
+  }
+}

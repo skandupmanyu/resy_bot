@@ -9,6 +9,7 @@ import time
 import json
 import re
 import getpass
+import os
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from urllib.parse import urlparse, parse_qs
@@ -31,6 +32,60 @@ class ResyBot:
         self.wait = None
         self.restaurant_url = None
         self.days_range = None
+        self.config = None
+        
+        # Load configuration
+        self.load_config()
+        
+    def load_config(self):
+        """Load configuration from config.json file."""
+        config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+        
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    self.config = json.load(f)
+                print("✅ Configuration loaded from config.json")
+            else:
+                print("⚠️ No config.json found. Creating from example...")
+                # Copy example config if main config doesn't exist
+                example_path = os.path.join(os.path.dirname(__file__), 'config.example.json')
+                if os.path.exists(example_path):
+                    import shutil
+                    shutil.copy(example_path, config_path)
+                    with open(config_path, 'r') as f:
+                        self.config = json.load(f)
+                    print("📝 Please edit config.json with your details before running the bot")
+                else:
+                    self.config = self.get_default_config()
+                    print("⚠️ Using default configuration")
+        except Exception as e:
+            print(f"⚠️ Error loading config: {e}")
+            self.config = self.get_default_config()
+    
+    def get_default_config(self):
+        """Return default configuration structure."""
+        return {
+            "resy_credentials": {
+                "email": "",
+                "password": ""
+            },
+            "reservation_settings": {
+                "restaurant_url": "",
+                "days_range": 7,
+                "default_first_slot": False
+            },
+            "automation_preferences": {
+                "auto_confirm_booking": False,
+                "preferred_time_slots": ["6:00 PM", "6:30 PM", "7:00 PM", "7:30 PM", "8:00 PM"],
+                "preferred_seating": ["Dining Room", "Indoor Dining Rm"]
+            },
+            "notifications": {
+                "success_message": True,
+                "booking_details": True,
+                "debug_output": True
+            }
+        }
         
     def setup_driver(self):
         """Set up Chrome WebDriver with proper configuration."""
@@ -98,15 +153,28 @@ class ResyBot:
         
         if success:
             print("🎉 Automated login completed successfully!")
+            time.sleep(2)  # Allow page to settle after login
             return True
         else:
             print("❌ Automated login failed")
             return False
     
     def get_login_credentials(self):
-        """Get username and password from user securely."""
+        """Get username and password from config or user input."""
+        # Try to get credentials from config first
+        if (self.config and 
+            self.config.get('resy_credentials', {}).get('email') and 
+            self.config.get('resy_credentials', {}).get('password')):
+            
+            username = self.config['resy_credentials']['email']
+            password = self.config['resy_credentials']['password']
+            print(f"✅ Using credentials from config for: {username}")
+            return username, password
+        
+        # Fallback to manual input if config is missing or empty
         print("\n🔐 Please provide your Resy login credentials:")
         print("Note: Your password will be hidden as you type")
+        print("💡 Tip: Add credentials to config.json to skip this step")
         
         username = input("📧 Email: ").strip()
         password = getpass.getpass("🔒 Password: ")
@@ -197,30 +265,61 @@ class ResyBot:
             return True  # Based on user confirmation that login works
         
     def get_user_inputs(self):
-        """Get restaurant URL and date range from user."""
-        print("\n📝 Please provide the following information:")
+        """Get restaurant URL and date range from config or user input."""
+        # Try to get restaurant URL from config
+        if (self.config and 
+            self.config.get('reservation_settings', {}).get('restaurant_url')):
+            
+            config_url = self.config['reservation_settings']['restaurant_url']
+            if self.validate_restaurant_url(config_url):
+                self.restaurant_url = config_url
+                print(f"✅ Using restaurant URL from config: {config_url}")
+            else:
+                print("⚠️ Invalid URL in config, requesting manual input")
+                self.restaurant_url = self.get_restaurant_url_input()
+        else:
+            print("\n📝 Please provide the following information:")
+            print("💡 Tip: Add restaurant_url to config.json to skip this step")
+            self.restaurant_url = self.get_restaurant_url_input()
         
-        # Get restaurant URL
+        # Try to get days range from config
+        if (self.config and 
+            self.config.get('reservation_settings', {}).get('days_range')):
+            
+            config_days = self.config['reservation_settings']['days_range']
+            if 1 <= config_days <= 30:
+                self.days_range = config_days
+                print(f"✅ Using days range from config: {config_days} days")
+            else:
+                print("⚠️ Invalid days_range in config, requesting manual input")
+                self.days_range = self.get_days_range_input()
+        else:
+            print("💡 Tip: Add days_range to config.json to skip this step")
+            self.days_range = self.get_days_range_input()
+                
+        print(f"✅ Will check reservations for {self.days_range} days starting from today")
+    
+    def get_restaurant_url_input(self):
+        """Get restaurant URL from user input with validation."""
         while True:
-            self.restaurant_url = input("\n🍽️ Enter the Resy restaurant URL: ").strip()
-            if self.validate_restaurant_url(self.restaurant_url):
-                break
+            url = input("\n🍽️ Enter the Resy restaurant URL: ").strip()
+            if self.validate_restaurant_url(url):
+                return url
             else:
                 print("❌ Invalid URL. Please enter a valid Resy restaurant URL.")
-                
-        # Get date range
+    
+    def get_days_range_input(self):
+        """Get days range from user input with validation."""
         while True:
             try:
                 days_input = input("\n📅 Enter number of days from today to check (e.g., 7 for next 7 days): ").strip()
-                self.days_range = int(days_input)
-                if 1 <= self.days_range <= 30:
-                    break
+                days = int(days_input)
+                if 1 <= days <= 30:
+                    return days
                 else:
                     print("❌ Please enter a number between 1 and 30.")
             except ValueError:
                 print("❌ Please enter a valid number.")
-                
-        print(f"✅ Will check reservations for {self.days_range} days starting from today")
         
     def validate_restaurant_url(self, url):
         """Validate that the URL is a valid Resy restaurant URL."""
@@ -337,7 +436,7 @@ class ResyBot:
         return available_slots
         
     def display_and_select_slot(self, available_slots):
-        """Display available slots and let user select one."""
+        """Display available slots and let user select one or auto-select first slot."""
         if not available_slots:
             print("\n❌ No available reservation slots found in the specified date range.")
             return None
@@ -350,6 +449,17 @@ class ResyBot:
             
         print("-" * 50)
         
+        # Check if auto-selection is enabled
+        if (self.config and 
+            self.config.get('reservation_settings', {}).get('default_first_slot', False)):
+            
+            selected_slot = available_slots[0]
+            print(f"\n🤖 Auto-selecting first available slot (default_first_slot = true)")
+            print(f"✅ Selected: {selected_slot['display']}")
+            return selected_slot
+        
+        # Manual selection
+        print("💡 Tip: Set default_first_slot = true in config.json to auto-select first slot")
         while True:
             try:
                 selection = input(f"\n🎯 Select a slot (1-{len(available_slots)}) or 'q' to quit: ").strip()
@@ -389,6 +499,9 @@ class ResyBot:
             
             # Handle any blocking modals first
             self.handle_modals_and_overlays()
+            
+            # Additional delay to ensure page is fully loaded
+            time.sleep(2)
             
             # Find and click the specific time slot
             print("🔍 Scanning available buttons on page...")
@@ -445,8 +558,8 @@ class ResyBot:
                 success = self.click_element_safely(target_button)
                 
                 if success:
-                    print("⏳ Clicked reservation button, looking for Reserve Now in iframe...")
-                    time.sleep(3)
+                    print("⏳ Clicked reservation button, waiting for page to update...")
+                    time.sleep(5)  # Increased delay for page/iframe to load after click
                     
                     # The Reserve Now button is in widgets.resy.com iframe, go directly there
                     if self.handle_iframe_interaction(None):
@@ -742,7 +855,7 @@ class ResyBot:
                         
                         # Switch to iframe
                         self.driver.switch_to.frame(iframe)
-                        time.sleep(2)
+                        time.sleep(4)  # Increased delay for iframe content to load
                         
                         # Look for the specific Reserve Now button we know exists
                         reserve_now_selectors = [
