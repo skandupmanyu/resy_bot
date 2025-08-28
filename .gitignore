@@ -64,6 +64,9 @@ logs/
 # Configuration files with credentials
 config.json
 
+# Chrome session data (contains login sessions)
+chrome_user_data/
+
 # Pytest
 .pytest_cache/
 .coverage

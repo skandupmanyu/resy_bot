@@ -77,6 +77,7 @@ class ResyBot:
             },
             "automation_preferences": {
                 "auto_confirm_booking": False,
+                "persist_session": True,
                 "preferred_time_slots": ["6:00 PM", "6:30 PM", "7:00 PM", "7:30 PM", "8:00 PM"],
                 "preferred_seating": ["Dining Room", "Indoor Dining Rm"]
             },
@@ -102,13 +103,24 @@ class ResyBot:
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         
+        # Add persistent session support to avoid repeated logins
+        persist_session = (self.config and 
+                          self.config.get('automation_preferences', {}).get('persist_session', True))
+        
+        if persist_session:
+            # Create a persistent user data directory for session persistence
+            user_data_dir = os.path.join(os.path.dirname(__file__), 'chrome_user_data')
+            chrome_options.add_argument(f"--user-data-dir={user_data_dir}")
+            print(f"💾 Using persistent session: {user_data_dir}")
+        else:
+            print("🔄 Using fresh session (session persistence disabled)")
+        
         try:
             print("⏳ Installing/updating ChromeDriver...")
             driver_path = ChromeDriverManager().install()
             print(f"✅ ChromeDriver installed at: {driver_path}")
             
             # Fix WebDriver Manager bug - sometimes returns wrong file path
-            import os
             if not os.access(driver_path, os.X_OK) or 'THIRD_PARTY_NOTICES' in driver_path:
                 # Find the actual chromedriver executable
                 driver_dir = os.path.dirname(driver_path)
@@ -136,12 +148,16 @@ class ResyBot:
             raise
         
     def login_flow(self):
-        """Handle automated login process."""
-        print("\n🔐 Starting automated login flow...")
+        """Handle automated login process with session persistence."""
+        print("\n🔐 Starting login flow...")
         
-        # Navigate to Resy homepage
-        self.driver.get("https://resy.com/")
-        time.sleep(3)
+        # Check if we're already logged in from a previous session
+        if self.check_existing_login():
+            print("🎉 Using existing login session!")
+            return True
+        
+        # If not logged in, proceed with automated login
+        print("🔐 Need to authenticate - starting login process...")
         
         # Get credentials from user
         username, password = self.get_login_credentials()
@@ -237,6 +253,72 @@ class ResyBot:
             print(f"❌ Login failed: {e}")
             return False
 
+    def check_existing_login(self):
+        """Check if user is already logged in from a previous session."""
+        try:
+            print("🔍 Checking for existing login session...")
+            
+            # Navigate to Resy homepage to check login status
+            self.driver.get("https://resy.com/")
+            time.sleep(3)
+            
+            # Look for indicators that user is logged in
+            login_indicators = [
+                # Look for user account/profile elements (typically show when logged in)
+                "//button[contains(@class, 'Button') and contains(@aria-label, 'user') or contains(@aria-label, 'account') or contains(@aria-label, 'profile')]",
+                "//div[contains(@class, 'user') or contains(@class, 'account') or contains(@class, 'profile')]",
+                "//*[contains(text(), 'My Reservations') or contains(text(), 'Account')]",
+                "//button[contains(text(), 'Account') or contains(text(), 'Profile')]",
+                
+                # Check for absence of login button (indicates already logged in)
+                "//nav[not(.//button[contains(text(), 'Log in')])]",
+                
+                # Look for booking-related elements that appear when logged in
+                "//button[contains(text(), 'Book') or contains(text(), 'Reserve')]",
+            ]
+            
+            # Check URL patterns that indicate logged-in state
+            current_url = self.driver.current_url.lower()
+            logged_in_url_patterns = ['account', 'user', 'profile', 'reservations']
+            url_indicates_login = any(pattern in current_url for pattern in logged_in_url_patterns)
+            
+            # Look for login button (if present, likely not logged in)
+            try:
+                login_buttons = self.driver.find_elements(By.XPATH, "//button[contains(text(), 'Log in') or contains(text(), 'Sign in')]")
+                has_login_button = any(btn.is_displayed() for btn in login_buttons)
+            except:
+                has_login_button = False
+            
+            # Check for logged-in indicators
+            logged_in_elements_found = 0
+            for selector in login_indicators:
+                try:
+                    elements = self.driver.find_elements(By.XPATH, selector)
+                    if any(elem.is_displayed() for elem in elements):
+                        logged_in_elements_found += 1
+                        print(f"   ✅ Found login indicator: {selector[:50]}...")
+                        break  # Found one, that's enough
+                except:
+                    continue
+            
+            # Determine if logged in based on evidence
+            evidence_score = logged_in_elements_found + (1 if url_indicates_login else 0) + (1 if not has_login_button else 0)
+            
+            if evidence_score >= 1 and not has_login_button:
+                print("✅ Already logged in! Skipping login process.")
+                return True
+            elif has_login_button:
+                print("🔐 Login button found - need to log in.")
+                return False
+            else:
+                print("❓ Login status unclear - will attempt login to be safe.")
+                return False
+                
+        except Exception as e:
+            print(f"⚠️ Error checking existing login: {e}")
+            print("🔐 Proceeding with login attempt to be safe.")
+            return False
+    
     def verify_login(self):
         """Verify that the user is logged in."""
         try:
@@ -415,6 +497,13 @@ class ResyBot:
         available_slots = []
         today = datetime.now().date()
         
+        # Check if we should auto-select first slot for optimization
+        auto_select_first = (self.config and 
+                           self.config.get('reservation_settings', {}).get('default_first_slot', False))
+        
+        if auto_select_first:
+            print("🚀 Optimization: Will auto-select first available slot, stopping search after finding slots")
+        
         # Navigate to restaurant page
         self.driver.get(self.restaurant_url)
         time.sleep(3)
@@ -430,6 +519,11 @@ class ResyBot:
             if slots:
                 available_slots.extend(slots)
                 print(f"   ✅ Found {len(slots)} available slots")
+                
+                # Optimization: If auto-selecting first slot, stop searching after finding any slots
+                if auto_select_first:
+                    print(f"🎯 Auto-select enabled: Stopping search after finding {len(available_slots)} slot(s)")
+                    break
             else:
                 print(f"   ❌ No available slots")
                 
