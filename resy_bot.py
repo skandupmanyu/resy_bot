@@ -514,30 +514,49 @@ class ResyBot:
             # Look for text patterns like "The next availability for 2 is Wed., Sep. 17"
             availability_patterns = [
                 # More specific patterns first to avoid false matches
+                # Pattern for "Wed., Sep. 17" format with punctuation
+                r"next availability for \d+ is\s+((?:\w+\.?,?\s+)?[A-Za-z]+\.?\s+\d{1,2})\.?",
+                r"next availability.*?is\s+((?:\w+\.?,?\s+)?[A-Za-z]+\.?\s+\d{1,2})\.?",
+                r"earliest availability.*?is\s+((?:\w+\.?,?\s+)?[A-Za-z]+\.?\s+\d{1,2})\.?",
+                r"available.*?on\s+((?:\w+\.?,?\s+)?[A-Za-z]+\.?\s+\d{1,2})\.?",
+                # Fallback patterns for broader matches
                 r"next availability for \d+ is\s+(.*?)(?:\.|$)",
-                r"next availability.*?is\s+((?:\w+\.?,?\s+)?\w+\.?\s+\d{1,2})",
-                r"earliest availability.*?is\s+((?:\w+\.?,?\s+)?\w+\.?\s+\d{1,2})",
-                r"available.*?on\s+((?:\w+\.?,?\s+)?\w+\.?\s+\d{1,2})",
-                # Fallback patterns
                 r"next availability.*?is\s+(.*?)(?:\.|$)",
                 r"next available.*?is\s+(.*?)(?:\.|$)"
             ]
             
             page_text = self.driver.page_source
             
-            print(f"🔍 DEBUG: Searching for availability suggestions in page content...")
+            # Clean HTML entities that might interfere with pattern matching
+            import html
+            page_text = html.unescape(page_text)
+            # Also handle &nbsp; specifically since it's common
+            page_text = page_text.replace('&nbsp;', ' ')
             
-            # Debug: Look for the specific text we expect
-            if "next availability" in page_text.lower():
+            # Strip HTML tags to get clean text for better pattern matching
+            import re
+            from bs4 import BeautifulSoup
+            try:
+                # Parse HTML and extract text content
+                soup = BeautifulSoup(page_text, 'html.parser')
+                clean_text = soup.get_text()
+                # Clean up whitespace
+                clean_text = re.sub(r'\s+', ' ', clean_text)
+                print(f"🔍 DEBUG: Searching for availability suggestions in cleaned text content...")
+            except Exception as e:
+                print(f"⚠️ HTML parsing failed, using raw text: {e}")
+                clean_text = page_text
+            
+            # Debug: Look for the specific text we expect in the cleaned text
+            if "next availability" in clean_text.lower():
                 # Find the specific sentence containing "next availability"
-                import re
-                sentences = re.findall(r'[^.!?]*next availability[^.!?]*[.!?]', page_text, re.IGNORECASE)
+                sentences = re.findall(r'[^.!?]*next availability[^.!?]*[.!?]', clean_text, re.IGNORECASE)
                 for sentence in sentences:
                     sentence = sentence.strip()
                     print(f"   📝 Found sentence: '{sentence[:100]}...' ")
             
             for i, pattern in enumerate(availability_patterns, 1):
-                matches = re.findall(pattern, page_text, re.IGNORECASE | re.DOTALL)
+                matches = re.findall(pattern, clean_text, re.IGNORECASE | re.DOTALL)
                 print(f"   🔍 Pattern {i}: '{pattern}' found {len(matches)} matches")
                 
                 for j, match in enumerate(matches):
@@ -575,19 +594,35 @@ class ResyBot:
         
         print(f"         🔍 DEBUG: Trying to parse date from: '{date_text}'")
         
+        # Month abbreviation mapping
+        month_abbrevs = {
+            'jan': 'january', 'feb': 'february', 'mar': 'march', 'apr': 'april',
+            'may': 'may', 'jun': 'june', 'jul': 'july', 'aug': 'august',
+            'sep': 'september', 'oct': 'october', 'nov': 'november', 'dec': 'december'
+        }
+        
         try:
             # Clean the text but preserve the original for debugging
             original_text = date_text
             date_text = date_text.strip().replace(',', '').replace('.', '')
             print(f"         🧹 Cleaned text: '{date_text}'")
             
+            # Expand month abbreviations to full names for easier parsing
+            words = date_text.lower().split()
+            for i, word in enumerate(words):
+                if word in month_abbrevs:
+                    words[i] = month_abbrevs[word]
+                    print(f"         🔄 Expanded '{word}' to '{month_abbrevs[word]}'")
+            expanded_text = ' '.join(words)
+            print(f"         📝 Expanded text: '{expanded_text}'")
+            
             # Common Resy date patterns
             patterns = [
-                # "Wed Sep 17" or "Wednesday September 17" (after cleaning)
+                # "Wed Sep 17" or "Wednesday September 17" (after cleaning and expansion)
                 (r'(\w+day)\s+(\w+)\s+(\d{1,2})', '%A %B %d'),
                 (r'(\w{3})\s+(\w+)\s+(\d{1,2})', '%a %B %d'),
                 
-                # "Sep 17" or "September 17" 
+                # "Sep 17" or "September 17" (after expansion)
                 (r'(\w+)\s+(\d{1,2})', '%B %d'),
                 
                 # "9/17" or "09/17"
@@ -601,7 +636,7 @@ class ResyBot:
             
             for i, (pattern, date_format) in enumerate(patterns, 1):
                 print(f"         🎯 Trying pattern {i}: '{pattern}' with format '{date_format}'")
-                match = re.search(pattern, date_text, re.IGNORECASE)
+                match = re.search(pattern, expanded_text, re.IGNORECASE)
                 if match:
                     print(f"            ✅ Pattern matched! Groups: {match.groups()}")
                     try:
