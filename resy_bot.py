@@ -11,6 +11,7 @@ import re
 import getpass
 import os
 from datetime import datetime, timedelta
+import threading
 from typing import List, Dict, Optional
 from urllib.parse import urlparse, parse_qs
 
@@ -78,8 +79,16 @@ class ResyBot:
             "automation_preferences": {
                 "auto_confirm_booking": False,
                 "persist_session": True,
+                "handle_captcha": True,
                 "preferred_time_slots": ["6:00 PM", "6:30 PM", "7:00 PM", "7:30 PM", "8:00 PM"],
                 "preferred_seating": ["Dining Room", "Indoor Dining Rm"]
+            },
+            "sniping": {
+                "enabled": False,
+                "snipe_time": "09:00",
+                "snipe_date": "today",
+                "max_attempts": 100,
+                "attempt_interval": 0.5
             },
             "notifications": {
                 "success_message": True,
@@ -93,15 +102,24 @@ class ResyBot:
         print("🚀 Setting up Chrome WebDriver...")
         
         chrome_options = Options()
+        # Enhanced anti-detection options
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
         chrome_options.add_argument("--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        
+        # Additional stealth options to reduce CAPTCHA triggers
         chrome_options.add_argument("--disable-web-security")
         chrome_options.add_argument("--allow-running-insecure-content")
         chrome_options.add_argument("--disable-extensions")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-features=VizDisplayCompositor")
+        chrome_options.add_argument("--disable-ipc-flooding-protection")
+        chrome_options.add_experimental_option("prefs", {
+            "profile.default_content_setting_values.notifications": 2,
+            "profile.managed_default_content_settings.images": 1
+        })
         
         # Add persistent session support to avoid repeated logins
         persist_session = (self.config and 
@@ -489,13 +507,247 @@ class ResyBot:
                 
         except Exception as e:
             print(f"   ⚠️ Error handling blocking modals: {e}")
+    
+    def parse_next_availability_date(self):
+        """Parse Resy's 'next availability' suggestion from the page."""
+        try:
+            # Look for text patterns like "The next availability for 2 is Wed., Sep. 17"
+            availability_patterns = [
+                # More specific patterns first to avoid false matches
+                r"next availability for \d+ is\s+(.*?)(?:\.|$)",
+                r"next availability.*?is\s+((?:\w+\.?,?\s+)?\w+\.?\s+\d{1,2})",
+                r"earliest availability.*?is\s+((?:\w+\.?,?\s+)?\w+\.?\s+\d{1,2})",
+                r"available.*?on\s+((?:\w+\.?,?\s+)?\w+\.?\s+\d{1,2})",
+                # Fallback patterns
+                r"next availability.*?is\s+(.*?)(?:\.|$)",
+                r"next available.*?is\s+(.*?)(?:\.|$)"
+            ]
+            
+            page_text = self.driver.page_source
+            
+            print(f"🔍 DEBUG: Searching for availability suggestions in page content...")
+            
+            # Debug: Look for the specific text we expect
+            if "next availability" in page_text.lower():
+                # Find the specific sentence containing "next availability"
+                import re
+                sentences = re.findall(r'[^.!?]*next availability[^.!?]*[.!?]', page_text, re.IGNORECASE)
+                for sentence in sentences:
+                    sentence = sentence.strip()
+                    print(f"   📝 Found sentence: '{sentence[:100]}...' ")
+            
+            for i, pattern in enumerate(availability_patterns, 1):
+                matches = re.findall(pattern, page_text, re.IGNORECASE | re.DOTALL)
+                print(f"   🔍 Pattern {i}: '{pattern}' found {len(matches)} matches")
+                
+                for j, match in enumerate(matches):
+                    date_text = match.strip()
+                    
+                    # Clean up the date text (remove extra spaces, periods, etc.)
+                    date_text = re.sub(r'\s+', ' ', date_text.strip(' .,'))
+                    
+                    print(f"      📍 Match {j+1}: '{date_text}'")
+                    
+                    if len(date_text) > 50:  # Skip if too long (probably not a date)
+                        print(f"         ❌ Too long ({len(date_text)} chars), skipping")
+                        continue
+                        
+                    # Try to parse various date formats
+                    parsed_date = self.parse_flexible_date(date_text)
+                    if parsed_date:
+                        print(f"✅ Successfully parsed suggested date: {parsed_date.strftime('%Y-%m-%d (%A, %B %d)')}")
+                        return parsed_date
+                    else:
+                        print(f"         ❌ Could not parse as date")
+                        
+        except Exception as e:
+            print(f"⚠️ Error parsing next availability: {e}")
+            import traceback
+            traceback.print_exc()
+            
+        print("   ℹ️ No valid date suggestions found")
+        return None
+    
+    def parse_flexible_date(self, date_text):
+        """Parse various date formats that Resy might use."""
+        import re
+        from datetime import datetime
+        
+        print(f"         🔍 DEBUG: Trying to parse date from: '{date_text}'")
+        
+        try:
+            # Clean the text but preserve the original for debugging
+            original_text = date_text
+            date_text = date_text.strip().replace(',', '').replace('.', '')
+            print(f"         🧹 Cleaned text: '{date_text}'")
+            
+            # Common Resy date patterns
+            patterns = [
+                # "Wed Sep 17" or "Wednesday September 17" (after cleaning)
+                (r'(\w+day)\s+(\w+)\s+(\d{1,2})', '%A %B %d'),
+                (r'(\w{3})\s+(\w+)\s+(\d{1,2})', '%a %B %d'),
+                
+                # "Sep 17" or "September 17" 
+                (r'(\w+)\s+(\d{1,2})', '%B %d'),
+                
+                # "9/17" or "09/17"
+                (r'(\d{1,2})/(\d{1,2})', '%m/%d'),
+                
+                # "2025-09-17"
+                (r'(\d{4})-(\d{1,2})-(\d{1,2})', '%Y-%m-%d')
+            ]
+            
+            current_year = datetime.now().year
+            
+            for i, (pattern, date_format) in enumerate(patterns, 1):
+                print(f"         🎯 Trying pattern {i}: '{pattern}' with format '{date_format}'")
+                match = re.search(pattern, date_text, re.IGNORECASE)
+                if match:
+                    print(f"            ✅ Pattern matched! Groups: {match.groups()}")
+                    try:
+                        # Handle different pattern groups
+                        if '%A' in date_format or '%a' in date_format:
+                            # Has day of week
+                            day_name, month_name, day = match.groups()
+                            date_str = f"{day_name} {month_name} {day}"
+                            print(f"            📅 Parsing: '{date_str}' with format '{date_format}'")
+                            parsed_date = datetime.strptime(date_str, date_format)
+                            # Add current year
+                            parsed_date = parsed_date.replace(year=current_year)
+                            
+                        elif '%B' in date_format:
+                            # Month name and day
+                            month_name, day = match.groups()
+                            date_str = f"{month_name} {day}"
+                            print(f"            📅 Parsing: '{date_str}' with format '{date_format}'")
+                            parsed_date = datetime.strptime(date_str, date_format)
+                            # Add current year
+                            parsed_date = parsed_date.replace(year=current_year)
+                            
+                        elif date_format == '%m/%d':
+                            # Month/day format
+                            month, day = match.groups()
+                            print(f"            📅 Parsing: month={month}, day={day}")
+                            parsed_date = datetime(current_year, int(month), int(day))
+                            
+                        elif date_format == '%Y-%m-%d':
+                            # Full date format
+                            year, month, day = match.groups()
+                            print(f"            📅 Parsing: year={year}, month={month}, day={day}")
+                            parsed_date = datetime(int(year), int(month), int(day))
+                        
+                        # If the date is in the past, assume next year
+                        if parsed_date.date() < datetime.now().date():
+                            print(f"            📆 Date {parsed_date.date()} is in past, moving to next year")
+                            parsed_date = parsed_date.replace(year=current_year + 1)
+                            
+                        print(f"            🎉 Successfully parsed date: {parsed_date.date()}")
+                        return parsed_date.date()
+                        
+                    except ValueError as e:
+                        print(f"            ❌ Failed to parse with pattern {date_format}: {e}")
+                        continue
+                else:
+                    print(f"            ❌ Pattern did not match")
+                        
+        except Exception as e:
+            print(f"⚠️ Error in flexible date parsing: {e}")
+            import traceback
+            traceback.print_exc()
+            
+        print(f"         ❌ Could not parse '{original_text}' as a date")
+        return None
+    
+    def detect_captcha(self):
+        """Detect if a CAPTCHA or security check is present."""
+        try:
+            captcha_indicators = [
+                # reCAPTCHA elements
+                "//div[contains(@class, 'g-recaptcha')]",
+                "//iframe[contains(@src, 'recaptcha')]",
+                "//div[contains(@class, 'recaptcha')]",
+                
+                # Security check modals
+                "//div[contains(text(), 'Security Check') or contains(text(), 'security check')]",
+                "//h1[contains(text(), 'Security Check')]",
+                "//h2[contains(text(), 'Security Check')]",
+                
+                # Human verification
+                "//div[contains(text(), 'verify') and contains(text(), 'human')]",
+                "//div[contains(text(), \"I'm not a robot\")]",
+                "//span[contains(text(), \"I'm not a robot\")]",
+                
+                # Common CAPTCHA text
+                "//*[contains(text(), 'complete this step to continue')]",
+                "//*[contains(text(), 'Please complete') and contains(text(), 'continue')]",
+                
+                # Cloudflare protection
+                "//div[contains(@class, 'cf-browser-verification')]",
+                "//*[contains(text(), 'Checking your browser')]"
+            ]
+            
+            for selector in captcha_indicators:
+                try:
+                    elements = self.driver.find_elements(By.XPATH, selector)
+                    for element in elements:
+                        if element.is_displayed():
+                            return True, selector
+                except:
+                    continue
+                    
+            return False, None
+            
+        except Exception as e:
+            print(f"⚠️ Error detecting CAPTCHA: {e}")
+            return False, None
+    
+    def handle_captcha_human_intervention(self):
+        """Handle CAPTCHA with human intervention."""
+        print("\n🤖➡️👤 CAPTCHA DETECTED - HUMAN INTERVENTION REQUIRED")
+        print("=" * 60)
+        print("🔒 Resy has shown a security check (CAPTCHA)")
+        print("👁️  Please look at your browser window and:")
+        print("   1. ✅ Complete the CAPTCHA challenge")
+        print("   2. ✅ Click any 'Continue' or 'Submit' buttons")
+        print("   3. ✅ Wait for the page to proceed")
+        print("   4. ⌨️  Return here and press Enter when done")
+        print()
+        print("💡 TIP: Don't close the browser - the bot will continue after you solve it!")
+        print("=" * 60)
+        
+        # Wait for user to solve CAPTCHA
+        user_input = input("✅ Press Enter after you've completed the CAPTCHA and security check...")
+        
+        # Give a moment for page to settle
+        time.sleep(3)
+        
+        # Verify CAPTCHA is resolved
+        captcha_present, selector = self.detect_captcha()
+        
+        if captcha_present:
+            print("⚠️ CAPTCHA still detected. Trying again...")
+            retry = input("🔄 Try again? The CAPTCHA might still be visible. Press Enter to continue or 'q' to quit: ")
+            if retry.lower() == 'q':
+                return False
+            time.sleep(2)
+            return self.handle_captcha_human_intervention()
+        else:
+            print("✅ CAPTCHA resolved! Continuing automation...")
+            return True
+    
+    def human_like_delay(self, min_seconds=1, max_seconds=3):
+        """Add human-like delays to reduce bot detection."""
+        import random
+        delay = random.uniform(min_seconds, max_seconds)
+        time.sleep(delay)
             
     def scrape_available_slots(self):
-        """Scrape available time slots for the specified date range."""
+        """Scrape available time slots using smart date detection."""
         print(f"\n🔍 Searching for available reservations...")
         
         available_slots = []
         today = datetime.now().date()
+        checked_dates = set()  # Track dates we've already checked
         
         # Check if we should auto-select first slot for optimization
         auto_select_first = (self.config and 
@@ -511,11 +763,66 @@ class ResyBot:
         # Handle any email signup or announcement modals that might block the interface
         self.handle_blocking_modals()
         
+        # STEP 1: Check today first
+        print(f"📅 Checking {today.strftime('%B %d, %Y')} (today)...")
+        slots = self.check_date_availability(today)
+        checked_dates.add(today)
+        
+        if slots:
+            available_slots.extend(slots)
+            print(f"   ✅ Found {len(slots)} available slots")
+            
+            if auto_select_first:
+                print(f"🎯 Auto-select enabled: Stopping search after finding {len(available_slots)} slot(s)")
+                return available_slots
+        else:
+            print(f"   ❌ No available slots")
+            
+            # STEP 2: Look for Resy's "next availability" suggestion
+            print("🧠 Smart date detection: Looking for Resy's availability suggestion...")
+            suggested_date = self.parse_next_availability_date()
+            
+            if suggested_date and suggested_date not in checked_dates:
+                # Make sure suggested date is within our range
+                days_from_today = (suggested_date - today).days
+                
+                if 0 <= days_from_today <= self.days_range:
+                    print(f"🎯 Jumping to suggested date: {suggested_date.strftime('%B %d, %Y')}")
+                    slots = self.check_date_availability(suggested_date)
+                    checked_dates.add(suggested_date)
+                    
+                    if slots:
+                        available_slots.extend(slots)
+                        print(f"   ✅ Found {len(slots)} available slots on suggested date!")
+                        
+                        if auto_select_first:
+                            print(f"🎯 Auto-select enabled: Stopping search after finding {len(available_slots)} slot(s)")
+                            return available_slots
+                    else:
+                        print(f"   ❌ No slots on suggested date either")
+                else:
+                    print(f"   ⚠️ Suggested date {suggested_date.strftime('%B %d, %Y')} is outside search range ({self.days_range} days)")
+            else:
+                if suggested_date:
+                    print(f"   ℹ️ Suggested date {suggested_date.strftime('%B %d, %Y')} already checked")
+                else:
+                    print(f"   ℹ️ No date suggestion found, proceeding with sequential search")
+        
+        # STEP 3: Sequential search for remaining dates (fallback)
+        print("📋 Checking remaining dates sequentially...")
+        
         for day_offset in range(self.days_range):
             target_date = today + timedelta(days=day_offset)
+            
+            # Skip dates we've already checked
+            if target_date in checked_dates:
+                continue
+                
             print(f"📅 Checking {target_date.strftime('%B %d, %Y')}...")
             
             slots = self.check_date_availability(target_date)
+            checked_dates.add(target_date)
+            
             if slots:
                 available_slots.extend(slots)
                 print(f"   ✅ Found {len(slots)} available slots")
@@ -653,7 +960,22 @@ class ResyBot:
                 
                 if success:
                     print("⏳ Clicked reservation button, waiting for page to update...")
-                    time.sleep(5)  # Increased delay for page/iframe to load after click
+                    
+                    # Add human-like delay
+                    self.human_like_delay(2, 4)
+                    
+                    # Check for CAPTCHA after clicking (if enabled)
+                    handle_captcha = (self.config and 
+                                    self.config.get('automation_preferences', {}).get('handle_captcha', True))
+                    
+                    if handle_captcha:
+                        captcha_present, selector = self.detect_captcha()
+                        
+                        if captcha_present:
+                            print("🔒 CAPTCHA detected after clicking reservation button!")
+                            if not self.handle_captcha_human_intervention():
+                                print("❌ CAPTCHA handling failed or cancelled")
+                                return False
                     
                     # The Reserve Now button is in widgets.resy.com iframe, go directly there
                     if self.handle_iframe_interaction(None):
@@ -698,14 +1020,25 @@ class ResyBot:
             # Format date for Resy URL
             date_str = date.strftime('%Y-%m-%d')
             
-            # Update URL with date parameter
+            # Construct URL with proper date parameter replacement
+            from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+            
             current_url = self.driver.current_url
-            if '?' in current_url:
-                separator = '&'
-            else:
-                separator = '?'
-                
-            date_url = f"{current_url}{separator}date={date_str}"
+            
+            # Parse the current URL
+            parsed = urlparse(current_url)
+            query_params = parse_qs(parsed.query)
+            
+            # Update/set the date parameter
+            query_params['date'] = [date_str]
+            
+            # Reconstruct the URL
+            new_query = urlencode(query_params, doseq=True)
+            date_url = urlunparse((
+                parsed.scheme, parsed.netloc, parsed.path,
+                parsed.params, new_query, parsed.fragment
+            ))
+            
             self.driver.get(date_url)
             time.sleep(2)
             
@@ -880,6 +1213,9 @@ class ResyBot:
     def click_element_safely(self, element):
         """Try to click an element with multiple fallback methods."""
         try:
+            # Add small human-like delay before clicking
+            self.human_like_delay(0.5, 1.5)
+            
             # Method 1: Regular click
             element.click()
             return True
@@ -949,7 +1285,26 @@ class ResyBot:
                         
                         # Switch to iframe
                         self.driver.switch_to.frame(iframe)
-                        time.sleep(4)  # Increased delay for iframe content to load
+                        
+                        # Human-like delay for iframe loading
+                        self.human_like_delay(3, 5)
+                        
+                        # Check for CAPTCHA in iframe (if enabled)
+                        handle_captcha = (self.config and 
+                                        self.config.get('automation_preferences', {}).get('handle_captcha', True))
+                        
+                        if handle_captcha:
+                            captcha_present, selector = self.detect_captcha()
+                            if captcha_present:
+                                # Switch back to main content for CAPTCHA handling
+                                self.driver.switch_to.default_content()
+                                print("🔒 CAPTCHA detected in booking iframe!")
+                                if not self.handle_captcha_human_intervention():
+                                    print("❌ CAPTCHA handling failed")
+                                    return False
+                                # Switch back to iframe after CAPTCHA is resolved
+                                self.driver.switch_to.frame(iframe)
+                                self.human_like_delay(2, 3)
                         
                         # Look for the specific Reserve Now button we know exists
                         reserve_now_selectors = [
@@ -1541,6 +1896,207 @@ class ResyBot:
         else:
             print("❌ Manual booking not completed.")
             return False
+    
+    def parse_snipe_time(self):
+        """Parse and validate sniping configuration."""
+        try:
+            snipe_config = self.config.get('sniping', {})
+            
+            if not snipe_config.get('enabled', False):
+                return None
+                
+            # Parse snipe time (format: "HH:MM")
+            snipe_time_str = snipe_config.get('snipe_time', '09:00')
+            snipe_date_str = snipe_config.get('snipe_date', 'today')
+            
+            # Validate time format
+            try:
+                time_parts = snipe_time_str.split(':')
+                hour = int(time_parts[0])
+                minute = int(time_parts[1])
+                
+                if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                    raise ValueError("Invalid time range")
+                    
+            except (ValueError, IndexError):
+                print(f"❌ Invalid snipe_time format: '{snipe_time_str}'. Use HH:MM format (e.g., '09:00')")
+                return None
+            
+            # Determine snipe date
+            now = datetime.now()
+            
+            if snipe_date_str.lower() == 'today':
+                snipe_date = now.date()
+            elif snipe_date_str.lower() == 'tomorrow':
+                snipe_date = now.date() + timedelta(days=1)
+            else:
+                # Try to parse as YYYY-MM-DD
+                try:
+                    snipe_date = datetime.strptime(snipe_date_str, '%Y-%m-%d').date()
+                except ValueError:
+                    print(f"❌ Invalid snipe_date format: '{snipe_date_str}'. Use 'today', 'tomorrow', or YYYY-MM-DD")
+                    return None
+            
+            # Create target datetime
+            snipe_datetime = datetime.combine(snipe_date, datetime.strptime(snipe_time_str, '%H:%M').time())
+            
+            # Validate snipe time isn't in the past (with 5 minute buffer)
+            if snipe_datetime < now - timedelta(minutes=5):
+                print(f"⚠️ Snipe time {snipe_datetime.strftime('%Y-%m-%d %H:%M')} is in the past")
+                
+                # If it's today but past, assume tomorrow
+                if snipe_date_str.lower() == 'today':
+                    snipe_datetime = snipe_datetime + timedelta(days=1)
+                    print(f"🔄 Adjusted to tomorrow: {snipe_datetime.strftime('%Y-%m-%d %H:%M')}")
+                else:
+                    return None
+            
+            return {
+                'target_time': snipe_datetime,
+                'max_attempts': snipe_config.get('max_attempts', 100),
+                'attempt_interval': snipe_config.get('attempt_interval', 0.5)
+            }
+            
+        except Exception as e:
+            print(f"❌ Error parsing snipe configuration: {e}")
+            return None
+    
+    def wait_for_snipe_time(self, snipe_info):
+        """Wait until the snipe time arrives with countdown."""
+        target_time = snipe_info['target_time']
+        now = datetime.now()
+        
+        if target_time <= now:
+            print("🎯 Snipe time has arrived! Starting immediately...")
+            return True
+        
+        time_diff = target_time - now
+        total_seconds = int(time_diff.total_seconds())
+        
+        print(f"\n⏰ SNIPING MODE ACTIVATED")
+        print(f"🎯 Target time: {target_time.strftime('%A, %B %d at %H:%M:%S')}")
+        print(f"⏳ Waiting: {time_diff}")
+        print("=" * 60)
+        
+        # Countdown in intervals
+        while datetime.now() < target_time:
+            remaining = target_time - datetime.now()
+            seconds_left = int(remaining.total_seconds())
+            
+            if seconds_left <= 0:
+                break
+            
+            # Show countdown at different intervals
+            if seconds_left > 3600:  # More than 1 hour
+                if seconds_left % 300 == 0:  # Every 5 minutes
+                    hours = seconds_left // 3600
+                    minutes = (seconds_left % 3600) // 60
+                    print(f"⏳ {hours}h {minutes}m remaining until snipe time...")
+            elif seconds_left > 60:  # More than 1 minute
+                if seconds_left % 30 == 0:  # Every 30 seconds
+                    minutes = seconds_left // 60
+                    seconds = seconds_left % 60
+                    print(f"⏳ {minutes}m {seconds}s remaining...")
+            elif seconds_left > 10:  # Last minute
+                if seconds_left % 5 == 0:  # Every 5 seconds
+                    print(f"⏳ {seconds_left} seconds...")
+            else:  # Final countdown
+                print(f"🎯 {seconds_left}...")
+            
+            time.sleep(1)
+        
+        print("\n🚀 SNIPE TIME REACHED! Starting reservation hunt...")
+        return True
+    
+    def snipe_reservation(self, snipe_info):
+        """Rapidly check for and book reservations during snipe mode with smart date detection."""
+        print("\n🎯 SNIPING MODE: Rapid slot detection activated!")
+        
+        max_attempts = snipe_info['max_attempts']
+        attempt_interval = snipe_info['attempt_interval']
+        
+        # Navigate to restaurant page once
+        self.driver.get(self.restaurant_url)
+        time.sleep(2)
+        self.handle_blocking_modals()
+        
+        print(f"🔄 Will check for slots every {attempt_interval}s for up to {max_attempts} attempts")
+        print(f"📅 Using smart date detection + checking {self.days_range} days from today")
+        print("🎯 Looking for the FIRST available slot...")
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                print(f"\r🔍 Attempt {attempt}/{max_attempts} - Smart scanning...", end='', flush=True)
+                
+                today = datetime.now().date()
+                found_slots = []
+                checked_dates = set()
+                
+                # SMART SNIPE STEP 1: Check today first
+                slots = self.check_date_availability(today)
+                checked_dates.add(today)
+                
+                if slots:
+                    found_slots.extend(slots)
+                else:
+                    # SMART SNIPE STEP 2: Check suggested date
+                    suggested_date = self.parse_next_availability_date()
+                    
+                    if suggested_date and suggested_date not in checked_dates:
+                        days_from_today = (suggested_date - today).days
+                        if 0 <= days_from_today <= self.days_range:
+                            slots = self.check_date_availability(suggested_date)
+                            checked_dates.add(suggested_date)
+                            if slots:
+                                found_slots.extend(slots)
+                
+                # SMART SNIPE STEP 3: Quick sequential check if still nothing
+                if not found_slots:
+                    # Only check a few dates in snipe mode for speed
+                    max_snipe_dates = min(5, self.days_range)  # Limit to 5 dates for speed
+                    
+                    for day_offset in range(max_snipe_dates):
+                        target_date = today + timedelta(days=day_offset)
+                        
+                        if target_date in checked_dates:
+                            continue
+                            
+                        slots = self.check_date_availability(target_date)
+                        checked_dates.add(target_date)
+                        
+                        if slots:
+                            found_slots.extend(slots)
+                            break  # Take first slot found
+                
+                if found_slots:
+                    print(f"\n🎉 FOUND {len(found_slots)} AVAILABLE SLOTS on attempt {attempt}!")
+                    
+                    # Auto-select first slot in snipe mode
+                    selected_slot = found_slots[0]
+                    print(f"🎯 SNIPING: {selected_slot['display']}")
+                    
+                    # Immediately attempt to book
+                    print("⚡ BOOKING IMMEDIATELY...")
+                    success = self.make_reservation(selected_slot)
+                    
+                    if success:
+                        print(f"\n🎉 SNIPE SUCCESSFUL! Booked on attempt {attempt}")
+                        return True
+                    else:
+                        print(f"\n⚠️ Booking failed on attempt {attempt}, continuing...")
+                
+                # If no slots found, brief pause before next attempt
+                if attempt < max_attempts:
+                    time.sleep(attempt_interval)
+                    
+            except Exception as e:
+                print(f"\n⚠️ Error on attempt {attempt}: {e}")
+                if attempt < max_attempts:
+                    time.sleep(attempt_interval)
+                continue
+        
+        print(f"\n❌ Snipe completed after {max_attempts} attempts. No reservations secured.")
+        return False
         
     def run(self):
         """Main execution flow."""
@@ -1560,22 +2116,43 @@ class ResyBot:
             # Get user inputs
             self.get_user_inputs()
             
-            # Search for available slots
-            available_slots = self.scrape_available_slots()
+            # Check for sniping mode
+            snipe_info = self.parse_snipe_time()
             
-            # Display options and get selection
-            selected_slot = self.display_and_select_slot(available_slots)
-            
-            if selected_slot:
-                # Make reservation
-                success = self.make_reservation(selected_slot)
+            if snipe_info:
+                print("🎯 SNIPING MODE ENABLED!")
+                print(f"⏰ Target: {snipe_info['target_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"🔄 Max attempts: {snipe_info['max_attempts']}")
+                print(f"⚡ Interval: {snipe_info['attempt_interval']}s")
                 
-                if success:
-                    print("\n🎉 Bot execution completed!")
+                # Wait for snipe time
+                if self.wait_for_snipe_time(snipe_info):
+                    # Execute snipe
+                    success = self.snipe_reservation(snipe_info)
+                    
+                    if success:
+                        print("\n🎉 SNIPE SUCCESSFUL! Reservation secured!")
+                    else:
+                        print("\n❌ Snipe completed but no reservation secured")
                 else:
-                    print("\n❌ Failed to complete reservation")
+                    print("\n❌ Snipe cancelled")
             else:
-                print("\n👋 Bot execution cancelled by user")
+                # Normal mode - search for available slots
+                available_slots = self.scrape_available_slots()
+                
+                # Display options and get selection
+                selected_slot = self.display_and_select_slot(available_slots)
+                
+                if selected_slot:
+                    # Make reservation
+                    success = self.make_reservation(selected_slot)
+                    
+                    if success:
+                        print("\n🎉 Bot execution completed!")
+                    else:
+                        print("\n❌ Failed to complete reservation")
+                else:
+                    print("\n👋 Bot execution cancelled by user")
                 
         except KeyboardInterrupt:
             print("\n\n⏹️ Bot stopped by user")
